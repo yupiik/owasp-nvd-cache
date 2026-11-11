@@ -1,0 +1,101 @@
+name: Reusable OWASP Dependency-Check scan
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: Java version to run the Maven scan
+        type: string
+        default: '25'
+      fail-cvss:
+        description: Minimum CVSS score that fails the scan
+        type: string
+        default: '7'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ODC_VERSION: '13.0.0'
+      CACHE_REPOSITORY: 'yupiik/owasp-nvd-cache'
+      GH_TOKEN: ${{ github.token }}
+      FAIL_CVSS: ${{ inputs.fail-cvss }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Identify newest compatible vulnerability database
+        id: snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="$(gh release list \
+            --repo "$CACHE_REPOSITORY" \
+            --limit 100 \
+            --exclude-drafts \
+            --exclude-pre-releases \
+            --json tagName \
+            --jq '[.[] | select(.tagName | startswith("odc-13.0.0-"))][0].tagName // ""')"
+          if [[ -z "$release_tag" ]]; then
+            echo "No published database for Dependency-Check $ODC_VERSION" >&2
+            exit 1
+          fi
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "Using snapshot: $release_tag"
+
+      - name: Restore repository-local snapshot cache
+        id: data-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/odc-data
+          key: odc-${{ runner.os }}-13.0.0-${{ steps.snapshot.outputs.tag }}
+
+      - name: Download and verify shared snapshot (on cache miss)
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download '${{ steps.snapshot.outputs.tag }}' \
+            --repo "$CACHE_REPOSITORY" \
+            --pattern odc-data.tar.gz \
+            --pattern odc-data.tar.gz.sha256 \
+            --dir "$RUNNER_TEMP"
+          (cd "$RUNNER_TEMP" && sha256sum -c odc-data.tar.gz.sha256)
+          tar -xzf "$RUNNER_TEMP/odc-data.tar.gz" -C "$RUNNER_TEMP"
+
+      - name: Assert vulnerability database is present
+        shell: bash
+        run: test -s "$RUNNER_TEMP/odc-data/odc.mv.db"
+
+      - name: Scan Maven dependencies (including submodules)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn --batch-mode --no-transfer-progress \
+            org.owasp:dependency-check-maven:${ODC_VERSION}:aggregate \
+            -DdataDirectory="$RUNNER_TEMP/odc-data" \
+            -DautoUpdate=false \
+            -DfailBuildOnCVSS="$FAIL_CVSS" \
+            -DfailOnError=true \
+            -Dformat=HTML,JSON,SARIF
+
+      - name: Upload scan reports even when vulnerabilities fail the scan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: '**/target/dependency-check-report.*'
+          if-no-files-found: warn
+          retention-days: 30
