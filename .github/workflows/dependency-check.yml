@@ -89,7 +89,7 @@ jobs:
             -DautoUpdate=false \
             -DfailBuildOnCVSS="$FAIL_CVSS" \
             -DfailOnError=true \
-            -Dformat=HTML,JSON,SARIF
+            -Dformats=HTML,JSON,SARIF
 
       - name: Upload scan reports even when vulnerabilities fail the scan
         if: always()
